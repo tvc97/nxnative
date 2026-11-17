@@ -15,6 +15,7 @@ A Switch 2 game: update v131072, SDK 22.2.8 (`Ounce`). Nintendo EPD's engine (se
 | `tex_flush_upload on`, `tex_dirty_upload on` | `game.tsv` | as Tears of the Kingdom: the CPU writes the terrain tiles' height (R32F), blend and hole (RGBA8) maps into textures after creating them. Without the keys those textures stay zero: flat blue holes in the ground around the path with grass floating in them, and grey stone where the console shows dirt |
 | `shader_groups`, `shader_note` | `game.tsv` | shaders grouped as `/Shader/`, `/Effect/`, `/Lib/`, `/UI/` |
 | `pad_layout full` | `game.tsv` | a 3D field and both sticks |
+| `fps_max 120` | `game.tsv` | the frame ratio's stub takes ticks of 1/120 s (`STEP_TICKS`), so the launcher's Frame rate offers 120 ([Frame rate](#frame-rate)) |
 
 Render conditions, which the host evaluates for every game ([Conditional rendering evaluated at replay](../../../docs/reference/rendering.md#conditional-rendering-evaluated-at-replay); until 2026-11-12 the profile key `render_cond`): agl clears a copy of the prepass depth again under a render condition the console skips. Run unconditionally, the opaque pass's `EQUAL` test fails everywhere ([PR 1299](https://github.com/seedds/nxnative/pull/1299)'s finding).
 
@@ -29,6 +30,11 @@ One [NUP container](../../../docs/development.md#the-packing-script-in-detail) o
 - Current: [`RED.F32.FTZ.RN`](../../../docs/reference/shaders.md#float-atomics-in-storage-memory) translates. The build's `Attribute offset 0x5C is not valid` (about 2,300 shaders) is a vertex shader's write to an output the translator drops, probably a shading rate, as `nvnCommandBufferBindShadingRateImage` and its family are no-ops: everything shades at full rate, which is right to look at and costs GPU time. Not verified against the hardware.
 
 ## Frame rate
+
+- Current (2026-11-17): **120 fps** (`DM_FPS_TARGET=120`, the launcher's Frame rate). The frame ratio's stub divides the host's step by the tick rate at state `+0x44` ([`patches.py`](patches.py); [120 fps follows the frame step](../../../docs/reference/frame-rate.md#120-fps-follows-the-frame-step)), so at 120 the ratio is 0.5 a frame, 1 at a hold of 2 ticks and 1.5 for a payback. The game's other division by its frame rate, `main+0x3b4eaf8` (named in MacNativeGames' notes), writes a global (`0x4d41fc8`) that nothing in `main` reads, so it is left alone. Measured on an M4 Pro (14 CPU cores, 64 GB, macOS 27.2, 4K 240 Hz screen), headless, `kokiri-deck` from a copy of a player's save (it loads in the Kokiri Forest's Lost Woods passage), one run each, `scripts/bench.py`:
+  - docked: GPU p50 10.8 ms at both rates, so 120 held only part of the time (463 of the first 1,800 frames at hold 1), then 60 (hold 2 ticks). The window was 60 fps at both. The host's game time was 1.000 of real time at both;
+  - handheld (`DM_OPMODE=0`): GPU p50 7.6 ms, 81.7 fps over the window against 59.3, the last 15 s all at hold 1 (120 fps), game time 1.000 of real time. Shots mid camera-turn (110 s) show the same view at both rates, so the camera's stick steps by the ratio.
+  - Open: the game time is the stub's own count. On this route Link walks into roots at both rates, so a walk's length on open ground has not been compared at 60 and 120; nor have animation timing, physics (a jump, a fall), the Deku Scrub fights or a boss. The intro narration and cutscenes above 60 are a known risk in a recompiled port of this game (Longshot's notes); movies cap at 60 here (2 ticks).
 
 Measured on an M6 Mac with 16 GB, headless, on one walk with camera turns (`walk.sh` in the work folder).
 
@@ -176,6 +182,7 @@ Its 37 kernels that correct samples, NDSR's network among them, gave about 0.25 
 
 ## Found on this game
 
+- [120 fps follows the frame step](../../../docs/reference/frame-rate.md#120-fps-follows-the-frame-step): frame step stubs that take ticks (`STEP_TICKS`), first here (2026-11-17; [Frame rate](#frame-rate)).
 - [Live BUFFER ordering and mapping](../../../docs/reference/rendering.md#sampled-buffer-reads-follow-source-writes-and-mappings): synthetic source-review proof for issue #2247. No Ocarina floor/glow artifact or performance improvement is attributed to this change.
 
 - [Private buffer texture fallback API guards](../../../docs/reference/rendering.md#private-buffer-texture-fallbacks-must-not-query-cpu-contents): synthetic source-review tests reproduce a validation abort when the existing unsupported-storage fallback queries private buffer contents. The guard preserves that fallback; GPU snapshot ordering and Ocarina artifact reachability remain open.
