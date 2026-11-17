@@ -279,6 +279,7 @@ static void read_layout(module_t *m, const char *dir) {
         else if (!strcmp(key, "FPS_STATE_OFF")) m->fps_state_off = v;
         else if (!strcmp(key, "RENDER_SCALE")) m->render_scale_max = (uint32_t)v;
         else if (!strcmp(key, "STEP_MAX")) m->step_max = (uint32_t)v;
+        else if (!strcmp(key, "STEP_TICKS")) m->step_ticks = v != 0;
         else if (!strcmp(key, "UE_MALLOC_VT")) m->ue_malloc_vt = v;
         else if (!strcmp(key, "UE_MALLOC_SLOT")) m->ue_malloc_slot = (unsigned)v;
         else if (!strcmp(key, "FPS_TARGET_PTR")) m->fps_target_ptr = v;
@@ -320,12 +321,13 @@ static void read_layout(module_t *m, const char *dir) {
 // target, 0 = the game's own interval logic. The profile's fps_target, overridden by DM_FPS_TARGET (0, 30 or 60); the graphics layer decides the steps and paces presents
 // (hle_nvn.c fstep_tick)
 uint8_t *dm_fps_state;
+int dm_fps_step_ticks;   // STEP_TICKS in the fixups table: the stubs divide the step by the tick rate at state +0x44 (0 = 60), so the host can count in ticks of 1/120 s
 int dm_fps_step_max;   // the largest step the stubs give the game (STEP_MAX in its fixups table; 0 = FSTEP_MAX): the frame step holds frames and pays back within it (hle_nvn.c)
 static const char *g_fps_mod;   // the module holding the state page (for the log)
 static float g_render_scale_max = 1.0f;   // the render-scale stub's largest scale (RENDER_SCALE in its fixups table; 1 for a stub that only lowers the game's size)
 static void install_fps_state(module_t *m) {
     if (m->fps_state_off + 0x40 > m->size || m->fps_state_off < m->key_page_off + m->key_page_size) die("%s: frame step state page out of range", m->name);
-    dm_fps_state = m->base + m->fps_state_off; g_fps_mod = m->name; dm_fps_step_max = (int)m->step_max;
+    dm_fps_state = m->base + m->fps_state_off; g_fps_mod = m->name; dm_fps_step_max = (int)m->step_max; dm_fps_step_ticks = (int)m->step_ticks;
     if (m->render_scale_max > 1) g_render_scale_max = (float)m->render_scale_max;
 }
 // The settings in the state page, written when the game starts (main.c, after host loading): on iOS the loading runs at app launch, before the launcher has set DM_FPS_TARGET and
@@ -333,8 +335,13 @@ static void install_fps_state(module_t *m) {
 void dm_fps_state_apply(void) {
     if (!dm_fps_state) return;
     const char *e = getenv("DM_FPS_TARGET"); int t = e ? atoi(e) : DM_GAME_FPS_TARGET;
-    if (t != 0 && t != 30 && t != 60) { LOG("[RED] DM_FPS_TARGET=%s: must be 0, 30 or 60; using the game's own frame step", e); t = 0; }
+    // 120 (fps_max 120): only for stubs that take ticks (STEP_TICKS), which then count in ticks of 1/120 s (+0x44 the tick rate; 0 = 60, the vsyncs of the other stubs). The
+    // frame step (hle_nvn.c fps_high) holds 1 or 2 ticks and pays back with 3, so the game's ratio is its step in 1/60 s: 0.5, 1 or 1.5
+    int ticks = t == 120 && DM_GAME_FPS_MAX >= 120 && dm_fps_step_ticks;
+    if (t == 120 && !ticks) { LOG("[RED] DM_FPS_TARGET=120: %s; running at 60", DM_GAME_FPS_MAX < 120 ? "this game's fps_max is 60" : "this main's frame step stubs take whole vsyncs of 1/60 s"); t = 60; }
+    if (t != 0 && t != 30 && t != 60 && !ticks) { LOG("[RED] DM_FPS_TARGET=%s: must be 0, 30, 60 or 120 (fps_max 120); using the game's own frame step", e); t = 0; }
     float f = (float)t; memcpy(dm_fps_state, &f, sizeof f);
+    uint32_t hz = ticks ? 120 : 0; memcpy(dm_fps_state + 0x44, &hz, sizeof hz);
     // Render scale of the 3D views (the stubs at Tears of the Kingdom's main+0xd5cc0, Breath of the Wild's main+0x1266880, Hades II's render size): 1.0 keeps the game's own size
     // and dynamic resolution; another factor fixes the size at that fraction (DM_RENDER_SCALE, 0.5 to the stub's largest scale: 1.0, or above for a stub that also raises it,
     // Hades II's 3.0). Independent of the frame step: written at target 0 too
@@ -383,7 +390,7 @@ void dm_fps_state_apply(void) {
         }
     }
     char cap[32]; snprintf(cap, sizeof cap, ", capped at %d fps", t);
-    LOG("%s: frame step %s%s (%s)", g_fps_mod, !t ? "as the game sets it" : "in whole vsyncs decided by the host", t ? cap : "", e ? "DM_FPS_TARGET" : "game profile fps_target");
+    LOG("%s: frame step %s%s (%s)", g_fps_mod, !t ? "as the game sets it" : ticks ? "in ticks of 1/120 s decided by the host" : "in whole vsyncs decided by the host", t ? cap : "", e ? "DM_FPS_TARGET" : "game profile fps_target");
 }
 static void install_key_page(module_t *m) {
     if (m->key_page_off + m->key_page_size > m->size) die("%s: key page out of range", m->name);
