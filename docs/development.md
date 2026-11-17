@@ -400,6 +400,9 @@ python3 scripts/build_ipa_from_nsp.py ~/Games/MarioWonder -k ~/keys/prod.keys --
 # controllers by the letters printed on them by default (an Xbox pad's A is A; the launcher's Face buttons), instead of the Switch's positions
 python3 scripts/build_ipa_from_nsp.py ~/Games/OcarinaOfTime --platform mac-app --pad-face label
 
+# ExeFS mods built into the app: <NSP folder>/mods/<title ID>/, else the repository's mods/<title ID>/, is read by default, or --mods <folder> (--mods none leaves them out); see Mods below
+python3 scripts/build_ipa_from_nsp.py ~/Games/OcarinaOfTime --platform mac-app --mods ~/Mods/Ocarina
+
 # no motion controls, for when they misbehave: DM_MOTION=0 is built in (with --env-file's switches; also for --platform mac and mac-app); on the iPhone, DM_MOTION=1 in Documents/env.txt turns it back on
 python3 scripts/build_ipa_from_nsp.py ~/Games/BreathOfTheWild -k ~/keys/prod.keys --no-motion
 
@@ -428,9 +431,18 @@ python3 scripts/build_ipa_from_nsp.py ~/Games/MarioWonder -k ~/keys/prod.keys --
 python3 scripts/build_ipa_from_nsp.py ~/Games/MarioWonder -k ~/keys/prod.keys --platform mac-app --mac-sign "Developer ID Application: <name> (<team ID>)"
 ```
 
+### Mods
+
+A code mod (an ExeFS mod: IPS patches of a module and modules of its own, such as a `subsdk8`) cannot be dropped into a folder at run time, since the rewriter changes the game's code offline. The script builds it in instead, from the folder `--mods` / `MODS` names, else `<NSP folder>/mods/<title ID>/`, else this repository's [`mods/<title ID>/`](../mods/README.md) (Wayfarer for Ocarina of Time); `--mods none` builds without them. Each mod there is a folder or a `.zip` in the layout the Switch's mod loaders read (Atmosphère's `contents/<title ID>/`, a Ryujinx or yuzu-family mod folder). Any `exefs` folder in it is read:
+
+- `<build ID>.ips`: an IPS or IPS32 patch of the module whose build ID begins so. A patch for another update is left out, and the log says so.
+- `subsdk<N>`: a module the mod adds, rewritten like the game's and loaded in Horizon's order (main, the subsdks by number, sdk). The rewritten folder lists it in `mods.modules`, which `dm/host/main.c` reads.
+
+`dm/tools/exefs_mods.py` writes the version's ExeFS with the mods applied to `<version>/ExeFS+mods/` beside the original, with `mods.tsv` saying what each mod did. The rewrite reads that copy. A module built without unwind tables (a hand-built mod's, whose MOD0 has 0 for its eh_frame) is rewritten with no function starts. Wayfarer (Ocarina of Time) is built in this way ([its note](../dm/games/0400486024DEC000/README.md#found-on-this-game)). A mod that cannot be applied stops the build: a patch outside its module's segments, two mods adding the same module, or a damaged file. Other files, such as `main.npdm`, text files and a `romfs` folder, are left out. RomFS mods are read at run time through `DM_ROMFS_OVERLAY`. A mod runs as the game's own code, outside any sandbox, so add only mods you trust. Mods are built into Mac apps only for now: the iOS packer (`build_ipa.sh`) copies the profile's modules alone.
+
 `--platform` takes `ios` (the default: the IPA, or the Xcode project with `--prepare-xcode`), `mac` ([A Mac-only build for development](#a-mac-only-build-for-development)) and `mac-app` ([A Mac app](#a-mac-app)). With either Mac platform, `--seen-shaders` builds only the shaders a game's playtests used ([Building selected Mac shaders](#building-selected-mac-shaders)).
 
-In Spyder, open the script, fill in the settings at the top (`NSP_DIR`, `PROD_KEYS`, and optionally `PACKAGE`, `OUT_IPA`, `APP_NAME`, `BUNDLE_ID`, `ICON`, `FALLBACK_ICON`, `LANGUAGE`, `KEEP_EXTRACTED`, `PAD_FACE`, `SHOW_FPS`, `MOTION`, `PSO_GPUS`, `PLATFORM`, `PROGRAM_INDEX`, `SEEN_SHADERS`; for a game without a profile `HEAP_CHECK`, `HEAP_CHECK_SECS`, `PROVISIONAL`), and press F5. Empty paths are asked for at run time.
+In Spyder, open the script, fill in the settings at the top (`NSP_DIR`, `PROD_KEYS`, and optionally `PACKAGE`, `OUT_IPA`, `APP_NAME`, `BUNDLE_ID`, `ICON`, `FALLBACK_ICON`, `LANGUAGE`, `KEEP_EXTRACTED`, `MODS`, `PAD_FACE`, `SHOW_FPS`, `MOTION`, `PSO_GPUS`, `PLATFORM`, `PROGRAM_INDEX`, `SEEN_SHADERS`; for a game without a profile `HEAP_CHECK`, `HEAP_CHECK_SECS`, `PROVISIONAL`), and press F5. Empty paths are asked for at run time.
 
 What the script does:
 0. Before it extracts anything it checks the environment (`check_prereqs`, `check_native_python`): the Python modules and tools (glslang too, which an OpenGL game needs), the iOS SDK for an iPhone build (a separate download in Xcode's Components), the Metal compiler, and the shader translator, which it starts once with `--source-sha`, so a translator that does not start stops it here, not as an empty `xlate_source` at the shader step. A Python under Rosetta (an Intel Homebrew's) stops it too: the tools it starts run as Intel code, the Mac host's compile among them. No .NET is needed: the translator and `nx_extract` are committed native executables, and the script checks that `nx_extract` was built from the sources beside it ([native tools](reference/packing.md#building-needed-net-and-finding-its-runtime-kept-failing)).

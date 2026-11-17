@@ -81,6 +81,8 @@ PSO_GPUS = ''                           # NVN games: GPU architectures the app g
                                         #   empty = by the game's profile: its pso_gpu key (whitespace-separated architectures, joined with commas) when it sets pso_mtl4 on (the Metal 4 path, the only one that reads the archive on iOS, is on for it),
                                         #   else 'g18p' for a game without the key, and 'none' without pso_mtl4 on
                                         #   PLATFORM 'mac-app': the Mac app's archive (Resources/pso), empty = this Mac's GPU (e.g. 'g14s' for an M2 Max), 'none' = the app builds its bases on its first start
+MODS = ''                               # a folder of ExeFS mods built into the app (empty = <NSP folder>/mods/<title ID>/ when it exists, else this repository's mods/<title ID>/; 'none' = no mods): each a folder or .zip with an exefs folder
+                                        #   (<build ID>.ips patches, subsdk<N> modules: dm/tools/exefs_mods.py), applied before the rewrite; RomFS mods are read at run time (DM_ROMFS_OVERLAY)
 PAD_FACE = 'position'                   # a controller's face buttons by default (the launcher's Face buttons; the player can change it there): 'position' the Switch's layout (an Xbox pad's B is A),
                                         #   'label' by the letters printed on the pad (an Xbox pad's A is A); DM_PAD_FACE in the app's env.txt changes it without a rebuild
 SHOW_FPS = True                         # True shows the game's frame rate on the iPhone (frames on screen per second, top left); DM_SHOW_FPS=0 / 1 in the app's Documents/env.txt changes it without a rebuild
@@ -1573,6 +1575,38 @@ def provisional_modules(g, exe_dir, nros):
     return set_keys(g, {'modules': (' '.join(mods), f'the NROs the game loads at run time import from {why}, which main does not')} if add else {}, 'After the NRO collection', edit=row)
 
 
+def load_order(m):   # Horizon's load order of code modules: main, the subsdks by number, sdk (as dm/games/profile_guess.py load_order and dm/host/main.c load_rank)
+    return (m != 'main', m == 'sdk', int(m[6:]) if m.startswith('subsdk') and m[6:].isdigit() else 0)
+
+
+def mod_modules(exe_dir):   # the modules the mods built into this ExeFS add (exefs_mods.py's mods.tsv), in load order
+    t = Path(exe_dir) / 'mods.tsv'
+    if not t.is_file(): return []
+    rows = [l.split('\t') for l in t.read_text(encoding='utf-8').splitlines() if l and not l.startswith('#')]
+    return sorted({r[1] for r in rows if len(r) > 2 and r[2] == 'added'}, key=load_order)
+
+
+def exefs_with_mods(py, repo, game, nsp_dir, app, setting, logs):
+    """The ExeFS the rewrite reads: the version's own, or with ExeFS mods (dm/tools/exefs_mods.py) a copy beside it, <version>/ExeFS+mods, with their IPS patches applied and
+    their modules added. The mods folder: --mods / MODS, else <NSP folder>/mods/<title ID>/ when it exists, else the repository's mods/<title ID>/ (mods/README.md); 'none' turns them off"""
+    exe = game / 'ExeFS'; out = game / 'ExeFS+mods'
+    folder = None if setting == 'none' else Path(os.path.expanduser(setting)).resolve() if setting else next((d for d in (nsp_dir / 'mods' / f'{app:016X}', repo / 'mods' / f'{app:016X}') if d.is_dir()), None)
+    if folder is None or not folder.is_dir() or not any(p for p in folder.iterdir() if not p.name.startswith('.')):
+        if setting and setting != 'none': raise BuildError(f'--mods / MODS: no mods in {folder}')
+        rmtree(out); return exe
+    logs.mkdir(parents=True, exist_ok=True)
+    log = logs / 'mods.log'
+    with open(log, 'w') as f:
+        p = subprocess.run([str(py), str(repo / 'dm/tools/exefs_mods.py'), str(exe), str(folder), str(out)], stdout=f, stderr=subprocess.STDOUT)
+    lines = log.read_text(errors='replace').splitlines()
+    if p.returncode: raise BuildError(f'mods in {folder}: ' + (lines[-1] if lines else f'exit code {p.returncode}') + f' (full output: {log})')
+    for l in lines:
+        r = l.split('\t')
+        if len(r) == 3: say(f'mod {r[0]}: {r[1]}: {r[2]}')
+    say(f'mods: built in from {folder} ({len(mod_modules(out))} added module(s)); a mod runs as the game\'s own code, outside any sandbox: only add mods you trust')
+    return out
+
+
 def rewrite(py, repo, exe_dir, out, env, logs, g, provisional=False):
     """patch_nso.py on every code module (each writes its own <module>.* files, all the same build_src.sha256 line), each with its log, as many at once as the Mac has cores.
     The modules are the profile's and the NROs the game registers (collect_nros; nro.tsv beside them lists those); a provisional profile first gets the subsdks those NROs import from, and its build row every module it lists (provisional_modules).
@@ -1587,6 +1621,8 @@ def rewrite(py, repo, exe_dir, out, env, logs, g, provisional=False):
     nros = collect_nros(py, repo, rfs.source(exe_dir.parent), nro_dir, env, logs)
     if provisional: g = provisional_modules(g, exe_dir, nros)
     mods = g.modules_in(exe_dir)   # a version may lack a module of the profile another version has (game.py build_modules)
+    added = mod_modules(exe_dir)   # modules an ExeFS mod adds (exefs_with_mods): rewritten as the game's, and loaded after them in Horizon's order (mods.modules, dm/host/main.c)
+    if added: mods = sorted(mods + [m for m in added if m not in mods], key=load_order)
     manifest = nro_dir / 'nro.tsv'
     src = {m: exe_dir / m for m in mods} | nros
     names = list(src)
@@ -1601,6 +1637,7 @@ def rewrite(py, repo, exe_dir, out, env, logs, g, provisional=False):
         return capture_nro(py, repo, exe_dir, out, nro_dir, env, logs, g, provisional)
     tmp = out.with_name(out.name + '.partial'); rmtree(tmp); tmp.mkdir(parents=True); logs.mkdir(parents=True, exist_ok=True)
     if manifest.is_file(): shutil.copyfile(manifest, tmp / 'nro.tsv')   # refused-only manifests preserve the game's offline registration path too
+    if added: (tmp / 'mods.modules').write_text(''.join(f'{m}\n' for m in added))   # the host loads these besides the profile's modules (dm/host/main.c profile_modules)
     PROG.set(step=', '.join(mods) + (f' and {len(nros)} NROs' if nros else ''), done=0, total=len(names), unit='modules')
     procs, logf, todo, cores = {}, {}, list(names), max(2, os.cpu_count() or 4)
     jobs = max(1, min(cores, 2 * cores // max(1, len(names))))   # patch_nso.py workers per module, so parallel rewrites don't oversubscribe
@@ -3110,6 +3147,7 @@ def parse_args(argv):
                     '--no-prebake: the app builds them on its first start (default: the PREBAKE setting, on)')
     ap.add_argument('--seen-shaders', action=argparse.BooleanOptionalAction, help='--platform mac or mac-app: build only the shaders the profile\'s playtests used (its shader_seen.tsv) and those the last runs\' logs reported missing, not the whole map: '
                     'minutes instead of hours, but areas the list does not cover draw without the rest until this runs again (default: the SEEN_SHADERS setting, off)')
+    ap.add_argument('--mods', help='a folder of ExeFS mods to build into the app, or none (default: the MODS setting, else <NSP folder>/mods/<title ID>/ when it exists, else the repository\'s mods/<title ID>/)')
     ap.add_argument('--pad-face', choices=('position', 'label'), help='face buttons by default: position (the Switch\'s layout) or label (the letters printed on the pad, as on an Xbox pad) (default: the PAD_FACE setting, position)')
     ap.add_argument('--show-fps', action=argparse.BooleanOptionalAction, help='show the game\'s frame rate on the iPhone, frames on screen per second at the top left (default: the SHOW_FPS setting, on)')
     ap.add_argument('--motion', action=argparse.BooleanOptionalAction, help='pass a gyro controller\'s motion (on iOS also the phone\'s own) to games that read it; --no-motion builds with DM_MOTION=0, for when motion misbehaves (default: the MOTION setting, on)')
@@ -3428,7 +3466,7 @@ def main(args=None):
         + (f'; the game\'s languages: {" ".join(have)}' if have else '; the control data lists no languages (not checked)') + (' (DM_LANG=<code> in the run command changes it)' if mac else ' (DM_LANG=<code> in the app\'s Documents/env.txt changes it)'))
 
     patched = work / f'patched_{pkg_ver}'
-    g = rewrite(py, repo, game / 'ExeFS', patched, env, logs, g, provisional)
+    g = rewrite(py, repo, exefs_with_mods(py, repo, game, nsp_dir, app, args.mods or MODS, logs), patched, env, logs, g, provisional)
     if nd := captured_nros(patched): env = dict(env, DM_NRO_DIR=str(nd))
     chain_header(py, repo, env, logs)   # before any host is built
     if provisional or derived:   # (provisional) the heap check, then the region check (both only change keys the host is built with, not the rewrite or the shader steps)

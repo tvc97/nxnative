@@ -70,7 +70,7 @@ const dm_game_t *dm_game_cur(void) {
 #endif
 // The modules to load when the command line names none: those of the profile's build row for main's build (its build ID from the rewriter's main.fixups.tsv), else all the profile's
 // modules. A game's versions may differ in modules: Mario Kart World's base game has main subsdk0 (a Mono runtime) sdk, its update 1.8.0 main subsdk0 (the movie player) subsdk1 sdk
-static int profile_modules(const char *dir, const char **names) {
+static int profile_modules_of(const char *dir, const char **names) {
     const char *all[] = DM_GAME_MODULES;
     const struct { const char *build, *mods; } rows[] = {DM_GAME_BUILD_MODULES};
     char path[1024], line[256], bid[33] = "";
@@ -91,6 +91,29 @@ static int profile_modules(const char *dir, const char **names) {
     }
     for (int k = 0; k < DM_GAME_NMOD; k++) names[k] = all[k];
     return DM_GAME_NMOD;
+}
+
+// Horizon's load order: main, the subsdks by number, sdk (profile_guess.py load_order)
+static int load_rank(const char *m) { return !strcmp(m, "main") ? 0 : !strcmp(m, "sdk") ? 1000 : !strncmp(m, "subsdk", 6) ? 1 + atoi(m + 6) : 500; }
+// The profile's modules and those the build's ExeFS mods added (mods.modules beside the rewritten modules: the NSP script's mods step, dm/tools/exefs_mods.py), in Horizon's
+// load order, so a mod's subsdk sits between the game's modules as on the console (Wayfarer finds main by walking QueryMemory down from its own code). names holds at least
+// DM_GAME_NMOD + DM_MOD_MAX entries
+#define DM_MOD_MAX 8
+static int profile_modules(const char *dir, const char **names) {
+    int n = profile_modules_of(dir, names);
+    char path[1024], line[64]; snprintf(path, sizeof path, "%s/mods.modules", dir);
+    FILE *f = fopen(path, "r"); int added = 0;
+    while (f && added < DM_MOD_MAX && fgets(line, sizeof line, f)) {
+        line[strcspn(line, "\r\n")] = 0;
+        if (!*line || strchr(line, '/') || strlen(line) > 15) continue;
+        int dup = 0; for (int k = 0; k < n; k++) dup |= !strcmp(names[k], line);
+        if (dup) continue;
+        names[n++] = strdup(line); added++;
+        LOG("mods: module %s (built in by the mods step) loads with the game's", line);
+    }
+    if (f) fclose(f);
+    for (int i = 1; i < n; i++) for (int j = i; j > 0 && load_rank(names[j]) < load_rank(names[j - 1]); j--) { const char *t = names[j]; names[j] = names[j - 1]; names[j - 1] = t; }
+    return n;
 }
 
 // Host loading (independent of UIKit / Metal): read the NSO, relocate, forced take-over, probes / tick gate / keys, start prefetch. By default it runs synchronously in main;
@@ -128,7 +151,7 @@ static void host_preload(int argc, char **argv) {
     }
     { void dm_term_install(void); dm_term_install(); }   // SIGTERM graceful exit (hle_lifecycle.c)
     { void crash_set_dump_hook(void (*)(void)); void svc_thread_dump(void); crash_set_dump_hook(svc_thread_dump); }   // Dump guest thread state on a crash
-    const char *names[argc + DM_GAME_NMOD]; int n = 0;
+    const char *names[argc + DM_GAME_NMOD + DM_MOD_MAX]; int n = 0;
     int i = 2;
     for (; i < argc && strcmp(argv[i], "--"); i++) names[n++] = argv[i];
     if (i < argc && !strcmp(argv[i], "--")) for (i++; i < argc && g_argc < 63; i++) g_argv[g_argc++] = argv[i];
