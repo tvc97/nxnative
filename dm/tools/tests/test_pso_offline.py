@@ -15,6 +15,8 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import tracemalloc
 from unittest import mock
@@ -271,6 +273,7 @@ class BuildCase(unittest.TestCase):
         (self.prof / 'shader_pairs.tsv').write_text('# pairs\nv\tf\nv\tc\n')
         self.out, self.work, self.calls = self.t / 'out', self.t / 'work', []
         self.compiler = 'AIR-TT 1.0'
+        jobs = mock.patch.object(po, 'base_jobs', return_value=1); jobs.start(); self.addCleanup(jobs.stop)   # the order of the fake compiles below: one group at a time (BaseJobs runs them at once)
 
     def fake_run(self, cmd, **kw):
         cmd = [str(c) for c in cmd]
@@ -690,6 +693,39 @@ class Build(BuildCase):
             self.main('--batch-size', '1', '--os-min', '27.0')
         self.assertEqual(sorted(d.name for d in groups.iterdir()), ['00001', '00002'])
 
+    def test_base_groups_run_at_once_and_merge_in_order(self):   # Ocarina of Time's 34 groups one after the other kept 2-3 of an M4 Pro's cores busy for 21 min
+        bases = [('v_bp', f'vertex{i}', 'f_b', 'main0') for i in range(6)]
+        runner, observed = self.batched_runner(fail_compile=('vertex1',))   # the first group leaves a base out: still listed first
+        started, both = threading.Event(), threading.Barrier(2, timeout=10)
+        def run(cmd, **kw):
+            names = ' '.join(map(str, cmd))
+            if 'metal-tt' in names and '-o' in names and 'batches.applegpu_g18p/0000' in names:
+                group = re.search(r'batches\.applegpu_g18p/(\d+)/', names).group(1)
+                if group in ('00001', '00002') and not started.is_set():
+                    both.wait()   # the first two groups' compilers run together, or this times out
+                    if group == '00002': started.set()
+                if group == '00001': time.sleep(0.05)   # the second group ends first
+            return runner(cmd, **kw)
+        with mock.patch.object(self, 'fake_run', run), mock.patch.object(po, 'plan', return_value=(bases, [], {})):
+            self.main('--batch-size', '2', '--os-min', '27.0', '--no-compute', '--base-jobs', '3')
+        merged = (self.out / 'applegpu_g18p.mtl4a').read_bytes()
+        pieces = [(self.work / f'batches.applegpu_g18p/{g}/applegpu_g18p.mtl4a').read_bytes() for g in ('00001', '00002', '00003')]
+        self.assertEqual(merged, b''.join(pieces))   # the groups' order, not the order they finished in
+        self.assertEqual((self.out / 'rest_pairs.tsv').read_text(), 'v\tf\n')
+        self.assertEqual(observed[-1], ('merge', 3))
+
+    def test_a_failed_group_starts_no_queued_one(self):
+        bases = [('v_bp', f'vertex{i}', 'f_b', 'main0') for i in range(8)]
+        runner, observed = self.batched_runner(fail_compile=('vertex0', 'vertex1'))   # nothing of the first group compiles: the tool's failure
+        def run(cmd, **kw):
+            if 'batches.applegpu_g18p/00002/' in ' '.join(map(str, cmd)) and 'metal-tt' in ' '.join(map(str, cmd)): time.sleep(0.5)   # under way while the first fails
+            return runner(cmd, **kw)
+        with mock.patch.object(self, 'fake_run', run), mock.patch.object(po, 'plan', return_value=(bases, [], {})), self.assertRaises(SystemExit):
+            self.main('--batch-size', '2', '--os-min', '27.0', '--no-compute', '--base-jobs', '2')
+        groups = {n for kind, names in observed if kind == 'compile' for n in names}
+        self.assertFalse(groups & {'vertex4', 'vertex5', 'vertex6', 'vertex7'})   # the third and fourth groups never started
+        self.assertFalse(list(self.out.glob('*.mtl4a')))
+
     def test_compute_pipelines_are_groups_of_their_own(self):
         (self.prof / 'shader_map.tsv').write_text('package\tindex\tstage\tdm_ctl_sha16\tsource\ncs\t0\tcompute\tk\tx\ncs\t1\tcompute\tkc\tx\n')
         (self.prof / 'pso_manifest.tsv').write_text('# list\nC\tk_b\n')
@@ -1065,6 +1101,24 @@ class Default(unittest.TestCase):
     def test_breath_of_the_wild(self):   # the profile that turns the Metal 4 path on: its app gets the archive
         r = subprocess.run([sys.executable, str(REPO / 'dm/games/game.py'), '01007EF00011E000', 'pso_mtl4', 'off'], capture_output=True, text=True)
         self.assertEqual(r.stdout.strip(), 'on')
+
+
+class BaseJobs(unittest.TestCase):
+    """How many base groups metal-tt compiles at once: memory and the work volume bound it, and an 8 GB Mac keeps one at a time"""
+    def jobs(self, gib, free_gib, cap=7):
+        with mock.patch.object(po, 'physical_gib', return_value=gib), mock.patch.object(po.vol_space, 'free_bytes', return_value=free_gib * 2**30):
+            return po.base_jobs(Path('.'), 1000, cap)
+    def test_bounds(self):
+        self.assertEqual(self.jobs(8, 500), 1)
+        self.assertEqual(self.jobs(16, 500), 2)
+        self.assertEqual(self.jobs(64, 500), 7)        # the cap: half the logical CPUs
+        self.assertEqual(self.jobs(64, 500, cap=3), 3)
+        self.assertEqual(self.jobs(64, 5), 2)          # room for two runs' temporaries
+        self.assertEqual(self.jobs(64, 1), 1)          # never none
+        self.assertEqual(self.jobs(0, 500), 1)         # memory unknown
+    def test_run_groups_keeps_the_order(self):
+        def fn(i): time.sleep(0.01 * (5 - i)); return i
+        self.assertEqual(po.run_groups(fn, [(i,) for i in range(5)], 5), list(range(5)))
 
 
 if __name__ == '__main__':

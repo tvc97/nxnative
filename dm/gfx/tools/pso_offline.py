@@ -30,12 +30,13 @@
 #                    prebuild tool with its index, and the tool's stamp (prewarm_host, below); the host opens them with the archive (pso_bundle_open_prewarm)
 # Each archive is made again only when its compiler inputs change (key.<arch> in the work folder): the complete pipeline configuration without library locations,
 # the referenced libraries' bytes, architecture, platform, minimum OS and metal-tt version. Chain/profile stamps are validated and refreshed independently.
-# More bases than --batch-size are compiled in sequential groups (batches.<arch>/<index>/ in the work folder, each cached by its own inputs) and merged with metal-pack: one metal-tt on
+# More bases than --batch-size are compiled in groups (batches.<arch>/<index>/ in the work folder, each cached by its own inputs) and merged with metal-pack: one metal-tt on
 # Super Mario Odyssey's 32,864 bases runs an 8 GB Mac out of paging space (docs/reference/shaders.md, Bounded groups for the offline pipeline compiler). The output is the same single file.
+# The groups run --base-jobs at a time, by default as many as memory and the work volume allow (base_jobs: one at a time on an 8 GB Mac), since one metal-tt keeps only 2-3 cores busy.
 # With compute pipelines, they and the bases are separate groups (batches.<arch>/c<index>/ and <index>/) merged the same way, so new pairs leave the compute pipelines compiled, and the
 # reverse. The compute groups are small (COMPUTE_BATCH) and run --jobs at a time: one metal-tt keeps about three cores busy.
 # Usage: pso_offline.py --msl <b-<chain> folder> --out <folder> --work <folder> [--game <id>] [--pairs <shader_pairs.tsv> [--pairs <pso_pairs.tsv>]] [--gpu g18p[,g17p]]
-#          [--depth gl|zero] [--platform ios|macos] [--os-min 27.0] [--script-only] [--batch-size N] [--shader-map <shader_map.tsv>] [--manifest <pso_manifest.tsv>] [--no-compute] [--jobs N]
+#          [--depth gl|zero] [--platform ios|macos] [--os-min 27.0] [--script-only] [--batch-size N] [--shader-map <shader_map.tsv>] [--manifest <pso_manifest.tsv>] [--no-compute] [--jobs N] [--base-jobs N]
 #          [--prewarm-host <Mac dmhost>]
 #   --game: the profile (DM_GAMES_DIR as for game.py) whose shader_pairs.tsv and pso_pairs.tsv are the pairs, whose shader_map.tsv and pso_manifest.tsv name the compute shaders, and
 #   whose depth_mode key the depth mode, unless --pairs / --shader-map / --manifest / --depth say; --no-compute: bases only; --jobs: metal-tt runs at a time for compute groups;
@@ -44,7 +45,7 @@
 #   --os-min: the archives' system (default: for iOS the SDK's major version, e.g. 27.0; for macOS the major version this Mac runs, since the Mac app is built for the Mac that builds it).
 #   A device opens only an archive of its own major version (macOS 27.2 refused archives made for 26.0 and 26.6 and opened those for 27.0 and 27.2), and builds the bases itself
 #   otherwise: the SDK's version on a Mac whose system is older than its Xcode's SDK (macOS 26.6 with Xcode 27.1) left that Mac without them (GitHub issue #673)
-import argparse, concurrent.futures, contextlib, filecmp, hashlib, json, os, shutil, struct, subprocess, sys, time
+import argparse, concurrent.futures, contextlib, filecmp, hashlib, json, os, shutil, struct, subprocess, sys, threading, time
 from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'tools'))
@@ -61,6 +62,8 @@ BATCH = 1000   # bases per metal-tt run: Odyssey's largest compiler lifetime foo
 MAX_FAILED = 8   # pipelines of one group metal-tt may fail on before the run counts as failed (compile_isolating)
 COMPUTE_BATCH = 16   # compute pipelines per metal-tt run, JOBS runs at a time: one metal-tt keeps about 2-3 cores busy: Star Fox's 233 took 268 s in 16 groups against 453 s in one run (M5 Pro, background priority, a loaded Mac)
 JOBS = max(1, (os.cpu_count() or 2) // 2)
+BASE_RUN_GIB = 4   # memory let to each base group's metal-tt when groups run at once (base_jobs): Odyssey's largest footprint at BATCH was 2.065 GiB
+BASE_RESERVE_GIB = 8   # memory kept for the rest of the Mac before a second group starts: an 8 GB Mac runs one group at a time, the case the groups were made for
 COLOUR = ('pixel_format', 'write_mask', 'blending_state', 'alpha_blend_operation', 'rgb_blend_operation', 'destination_alpha_blend_factor', 'destination_rgb_blend_factor',
           'source_alpha_blend_factor', 'source_rgb_blend_factor')
 
@@ -504,13 +507,44 @@ def groups_of(bases, computes, batch_size, compute_size=COMPUTE_BATCH):
     return groups
 
 
-def compile_batches(lib_dir, bases, work, part, arch, platform, osmin, toolchain, batch_size, computes=(), jobs=1, compute_size=COMPUTE_BATCH):
+def physical_gib():
+    try: return os.sysconf('SC_PHYS_PAGES') * os.sysconf('SC_PAGE_SIZE') / 2**30
+    except (ValueError, OSError): return 0
+
+
+def base_jobs(work, batch_size, cap=JOBS):
+    """Base groups that run at once (--base-jobs 0): one metal-tt keeps about 2-3 cores busy, so groups one after the other left most of a large Mac idle (Ocarina of Time's 34 groups of
+    1,000: 21 min on an M4 Pro). At most cap, BASE_RUN_GIB of memory each after BASE_RESERVE_GIB for the rest of the Mac, and as many as the work volume has room for (space_needed)"""
+    by_memory = int((physical_gib() - BASE_RESERVE_GIB) // BASE_RUN_GIB)
+    by_space = int(vol_space.free_bytes(work) // space_needed(batch_size or 1))
+    return max(1, min(cap, by_memory, by_space))
+
+
+def run_groups(fn, items, jobs):
+    """fn(*item) for each item, jobs at a time; the results in the items' order. The first failure (in that order) is raised once the runs under way end, and no queued one starts"""
+    stop = threading.Event()
+    class NotStarted(Exception): pass
+    def guarded(*it):
+        if stop.is_set(): raise NotStarted
+        try: return fn(*it)
+        except BaseException: stop.set(); raise
+    with concurrent.futures.ThreadPoolExecutor(max(1, jobs)) as pool:
+        futures = [pool.submit(guarded, *it) for it in items]
+        concurrent.futures.wait(futures)
+    for f in futures:
+        e = f.exception()
+        if e is not None and not isinstance(e, NotStarted): raise e
+    return [f.result() for f in futures]
+
+
+def compile_batches(lib_dir, bases, work, part, arch, platform, osmin, toolchain, batch_size, computes=(), jobs=1, compute_size=COMPUTE_BATCH, base_jobs_=1):
     """Limit compiler input size, then combine every completed group into the usual single archive.
 
     This bounds input count, not memory: a single pipeline can still exceed Apple's compiler resources.
     On M2, merged archives passed archive-only lookups of two synthetic pipelines and all 32,864 Odyssey bases.
     Other workloads and compiler versions can have different resource use.
-    The groups of bases run one after the other, as before; the compute groups, small, jobs at a time, each in its own folder (its TMPDIR).
+    The groups of bases run base_jobs_ at a time (base_jobs), then the compute groups, small, jobs at a time, each group in its own folder (its TMPDIR). The pieces are merged in the
+    groups' order and what they left out is listed in that order, whichever finished first, so the archive and failed.<arch>.tsv do not depend on the timing.
     """
     groups = groups_of(bases, computes, batch_size, compute_size); total = len(groups); names = {name for name, _, _ in groups}
     failed = ([], [])   # what the groups left out (compile_isolating), returned
@@ -520,12 +554,12 @@ def compile_batches(lib_dir, bases, work, part, arch, platform, osmin, toolchain
         print(f'pso_offline: {arch}: batch {index}/{total}: {f"{len(group)} bases" if group else f"{len(cgroup)} compute pipelines"}, compiling or checking cache', flush=True)
         piece, reused = compile_batch(lib_dir, group, work / f'batches.{arch}' / name, arch, platform, osmin, toolchain, cgroup)
         print(f'pso_offline: {arch}: batch {index}/{total}: ready ({"reused" if reused else "compiled"})', flush=True)
-        fb, fc = read_failed(work / f'batches.{arch}' / name, arch); failed[0].extend(fb); failed[1].extend(fc)
-        return piece
-    pieces = [one(i, *g) for i, g in enumerate(groups, 1) if g[1]]
-    with concurrent.futures.ThreadPoolExecutor(max(1, jobs)) as pool:   # a failed group stops the build once the others under way have finished (their pieces stay cached)
-        futures = [pool.submit(one, i, *g) for i, g in enumerate(groups, 1) if not g[1]]
-        pieces += [f.result() for f in futures]
+        return piece, read_failed(work / f'batches.{arch}' / name, arch)
+    # a failed group stops the build once the others under way have finished (their pieces stay cached)
+    done = run_groups(one, [(i, *g) for i, g in enumerate(groups, 1) if g[1]], base_jobs_)
+    done += run_groups(one, [(i, *g) for i, g in enumerate(groups, 1) if not g[1]], jobs)
+    pieces = [piece for piece, _ in done]
+    for _, (fb, fc) in done: failed[0].extend(fb); failed[1].extend(fc)
     part.unlink(missing_ok=True)
     need, free = max(2 << 30, sum(p.stat().st_size for p in pieces)), vol_space.free_bytes(work)
     if free < need: sys.exit(f'[RED] pso_offline: {free / 2**30:.1f} GB free before merging; need at least {need / 2**30:.1f} GB')
@@ -712,10 +746,10 @@ def prewarm_script_key(js, arch, platform, osmin, toolchain):
     return h.hexdigest()
 
 
-def prewarm_compile(made, mac, out, archs, platform, osmin, toolchain, work, lib_dir, batch_size):
+def prewarm_compile(made, mac, out, archs, platform, osmin, toolchain, work, lib_dir, batch_size, jobs=0):
     """The host's scripts (prewarm_host's folder made, its files named for this Mac's architecture mac) compiled for each of archs into out as <arch>-prewarm-<NN>.mtl4a, each with the
     index of its period (<mac>-prewarm-<NN>.keys: the same pipelines, so the same keys), and the tool's stamp prewarm.tsv. A script already compiled for these inputs is taken from
-    the cache (prewarm/<arch>/). → ({arch: files}, [(arch, script name, kind, why)] of pipelines left out). Raises PrewarmFailed (out then holds no prewarm file)"""
+    the cache (prewarm/<arch>/); jobs scripts compile at a time (0: base_jobs). → ({arch: files}, [(arch, script name, kind, why)] of pipelines left out). Raises PrewarmFailed (out then holds no prewarm file)"""
     pw, out = Path(work) / 'prewarm', Path(out)
     scripts = sorted(Path(made).glob('prewarm-*.mtl4-json'))
     todo = []
@@ -728,14 +762,14 @@ def prewarm_compile(made, mac, out, archs, platform, osmin, toolchain, work, lib
         for js in dict.fromkeys(js for _, js, _, _, _ in todo): shutil.copyfile(js, real_js / js.name)
         try: script_libraries(sorted(real_js.iterdir()), lib_dir, pw / 'libraries')
         except (LookupError, OSError, ValueError) as e: raise PrewarmFailed(str(e)) from e
-        try:
-            for arch, js, key, cache, kf in todo:
-                kf.unlink(missing_ok=True); cache.parent.mkdir(parents=True, exist_ok=True)
-                print(f'pso_offline: prewarm: {arch}: {js.name}, metal-tt ...', flush=True); t0 = time.time()
-                bad = compile_script(json.loads((real_js / js.name).read_text()), cache, pw / arch / f'{js.stem}.work', arch, platform, osmin, batch_size)
-                cache.with_suffix('.failed').write_text(''.join(f'{k}\t{compiler_line(why)}\n' for k, _, why in bad))
-                kf.write_text(key + '\n')
-                print(f'pso_offline: prewarm: {arch}: {js.name}: {cache.stat().st_size / 2**20:.0f} MB in {time.time() - t0:.0f} s' + (f', {len(bad)} pipelines left out' if bad else ''), flush=True)
+        def one(arch, js, key, cache, kf):   # each script in its own work folder and cache file
+            kf.unlink(missing_ok=True); cache.parent.mkdir(parents=True, exist_ok=True)
+            print(f'pso_offline: prewarm: {arch}: {js.name}, metal-tt ...', flush=True); t0 = time.time()
+            bad = compile_script(json.loads((real_js / js.name).read_text()), cache, pw / arch / f'{js.stem}.work', arch, platform, osmin, batch_size)
+            cache.with_suffix('.failed').write_text(''.join(f'{k}\t{compiler_line(why)}\n' for k, _, why in bad))
+            kf.write_text(key + '\n')
+            print(f'pso_offline: prewarm: {arch}: {js.name}: {cache.stat().st_size / 2**20:.0f} MB in {time.time() - t0:.0f} s' + (f', {len(bad)} pipelines left out' if bad else ''), flush=True)
+        try: run_groups(one, todo, jobs if jobs else base_jobs(pw, batch_size))   # the scripts at once, as the base groups (one metal-tt keeps 2-3 cores busy)
         finally: shutil.rmtree(pw / 'libraries', ignore_errors=True); shutil.rmtree(real_js, ignore_errors=True)
     files, failed, publish = {}, [], {}
     for arch in archs:
@@ -784,7 +818,7 @@ def update_prewarm(a, lib_dir, out, work, archs, zero):
             t1 = time.time(); n = rows.count('\n'); print(f'pso_offline: prewarm: {n} R and M rows, the host\'s prebuild tool (minutes when its inputs changed) ...', flush=True)
             made, mac, reused = prewarm_host(a.prewarm_host, lib_dir, a.shader_map[0] if a.shader_map else '', rows, work, zero)
             if reused: print('pso_offline: prewarm: the host\'s files reused (inputs unchanged)')
-            files, pfailed = prewarm_compile(made, mac, out, archs, a.platform, a.os_min or os_min_default(a.platform), tool_version(a.platform), work, lib_dir, a.batch_size)
+            files, pfailed = prewarm_compile(made, mac, out, archs, a.platform, a.os_min or os_min_default(a.platform), tool_version(a.platform), work, lib_dir, a.batch_size, a.base_jobs)
             size = sum(f.stat().st_size for fs in files.values() for f in fs)
             prewarm = f'{sum(map(len, files.values()))} files ({size / 2**20:.0f} MB) from {n} rows, {len(pfailed)} pipelines left out (metal-tt could not compile them: left to the device)'
             for arch, name, kind, why in pfailed: print(f'[RED] pso_offline: prewarm: {arch}: metal-tt cannot compile a pipeline of {name} ({kind}: {why}): left out, the device builds it', flush=True)
@@ -818,10 +852,13 @@ def main(argv=None):
     ap.add_argument('--manifest', action='append', help='pso_manifest.tsv: its C rows first (default: the profile\'s)')
     ap.add_argument('--no-compute', action='store_true', help='no compute pipelines, the bases alone')
     ap.add_argument('--jobs', type=int, default=JOBS, help=f'metal-tt runs at a time for the compute pipelines (default {JOBS}, half the logical CPUs)')
+    ap.add_argument('--base-jobs', type=int, default=0, help=f'base groups compiled at a time (default 0: as many as memory, {BASE_RUN_GIB} GiB each after {BASE_RESERVE_GIB} GiB, '
+                                                            f'and the work volume allow, at most --jobs; 1: one after the other)')
     ap.add_argument('--prewarm-host', help='a Mac host built from this checkout for this profile (make -C dm/host GAME=<id>): its prebuild tool makes the prewarm lists\' R and M rows\' '
                                            'pipelines from these libraries, and metal-tt compiles them for each --gpu (<arch>-prewarm-<NN>.mtl4a with its index); without it there are none')
     a = ap.parse_args(argv)
     if a.batch_size < 0: ap.error('--batch-size must be zero or positive')
+    if a.base_jobs < 0: ap.error('--base-jobs must be zero or positive')
     if a.game:
         sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'games')); import game
         g = game.load(a.game)
@@ -881,7 +918,9 @@ def main(argv=None):
         part = work / f'{arch}.mtl4a.partial'; part.unlink(missing_ok=True)
         t1 = time.time(); print(f'pso_offline: {arch}: metal-tt, {len(bases)} bases, {len(computes)} compute pipelines (minutes) ...', flush=True)
         if a.batch_size and len(groups_of(bases, computes, a.batch_size)) > 1:
-            fb, fc = compile_batches(lib_dir, bases, work, part, arch, a.platform, osmin, tv, a.batch_size, computes, a.jobs)
+            bj = a.base_jobs or base_jobs(work, a.batch_size, max(1, a.jobs))
+            if bj > 1: print(f'pso_offline: {arch}: {bj} base groups at a time', flush=True)
+            fb, fc = compile_batches(lib_dir, bases, work, part, arch, a.platform, osmin, tv, a.batch_size, computes, a.jobs, base_jobs_=bj)
         else:
             fb, fc = compile_isolating(lib_dir, bases, computes, js, part, work, arch, a.platform, osmin)
         write_failed(work, arch, fb, fc); failed_bases += fb; failed_computes += fc
