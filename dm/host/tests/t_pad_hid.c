@@ -12,6 +12,12 @@ int main(void) {
     h.buttons = 1u << 1; CHECK(pad_hid_buttons(&h) == DM_BTN_A);             // usage 2 (right) is A
     h.buttons = 1u << 0; CHECK(pad_hid_buttons(&h) == DM_BTN_B);             // usage 1 (bottom) is B
     h.buttons = 1u << 11 | 1u << 9; CHECK(pad_hid_buttons(&h) == (DM_BTN_PLUS | DM_BTN_ZR));
+    pad_hid_init_face(&h, NULL, 0, 1);                                        // DM_PAD_FACE=label: by the Xbox labels
+    h.buttons = 1u << 0; CHECK(pad_hid_buttons(&h) == DM_BTN_A); h.buttons = 1u << 1; CHECK(pad_hid_buttons(&h) == DM_BTN_B);
+    h.buttons = 1u << 3; CHECK(pad_hid_buttons(&h) == DM_BTN_X); h.buttons = 1u << 4; CHECK(pad_hid_buttons(&h) == DM_BTN_Y);
+    h.buttons = 1u << 11; CHECK(pad_hid_buttons(&h) == DM_BTN_PLUS);
+    pad_hid_init_face(&h, "A=3", 0, 1); h.buttons = 1u << 2; CHECK(pad_hid_buttons(&h) == DM_BTN_A);   // DM_HID_MAP still replaces entries
+    pad_hid_init_face(&h, NULL, 1, 1); h.buttons = 1u << 1; CHECK(pad_hid_buttons(&h) == DM_BTN_A);    // Nintendo's numbering: the same either way
     pad_hid_init(&h, "a=1,B=2,bogus=3,ZR=99,X=,MINUS=13", 0);
     h.buttons = 1u << 0; CHECK(pad_hid_buttons(&h) == DM_BTN_A);
     h.buttons = 1u << 12; CHECK(pad_hid_buttons(&h) == DM_BTN_MINUS);

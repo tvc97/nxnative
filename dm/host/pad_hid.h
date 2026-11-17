@@ -1,7 +1,7 @@
 // Raw HID gamepads that GameController does not list (an 8BitDo in its own mode: a Bluetooth HID gamepad macOS pairs, GitHub issue #637): one device's buttons, hat and axes
 // as HID reports them, turned into Switch buttons and sticks. Pure, so tests/t_pad_hid.c checks it without a controller; pad_hid_mac.h reads the devices.
 // Buttons by position, as front_mac.m maps GameController (right A, bottom B, top X, left Y). The default map is 8BitDo's D-input numbering (HID button usages 1 A, 2 B, 4 X,
-// 5 Y, 7 / 8 LB / RB, 9 / 10 LT / RT, 11 select, 12 start, 14 / 15 stick clicks, by Xbox labels); DM_HID_MAP=A=2,B=1,… replaces entries, DM_HID_LOG=1 logs each usage pressed.
+// 5 Y, 7 / 8 LB / RB, 9 / 10 LT / RT, 11 select, 12 start, 14 / 15 stick clicks, by Xbox labels); DM_HID_MAP=A=2,B=1,… replaces entries (DM_PAD_FACE=label puts the default's face buttons by label), DM_HID_LOG=1 logs each usage pressed.
 // Sticks: X / Y left, Z / Rz right (Rx / Ry on a device without Z); analog triggers (Brake / Accelerator) press ZL / ZR past half.
 // Nintendo's report descriptor (a Pro Controller clone of another vendor, such as a PowerA NANO, GitHub PR #989) is told by its reports, not its name or vendor (pad_hid_nin_bit):
 // a pad that declares the console's protocol is driven by it (pad_hid_mac.h: the handshake into report 0x30, read as pad_pro.h reads a Pro Controller); its simple report 0x3F,
@@ -50,9 +50,10 @@ static inline int pad_dupes_want(int n, int listed, int read, int due) { return 
 
 // DM_HID_MAP: comma-separated NAME=usage entries over the default map (an unknown name or a usage past 32 is skipped). nintendo: the buttons come in report 0x3F, whose
 // numbering is the default instead (usages 1 B, 2 A, 3 Y, 4 X, 5 / 6 L / R, 7 / 8 ZL / ZR, 9 minus, 10 plus, 11 / 12 stick clicks, 13 Home, 14 Capture), and the sticks are raw
-static void pad_hid_init(pad_hid *h, const char *map, int nintendo) {
-    static const uint8_t def[16] = {2, 1, 5, 4, 14, 15, 7, 8, 9, 10, 12, 11};
-    memset(h, 0, sizeof *h); h->hat = -1; h->raw = (uint8_t)!!nintendo; memcpy(h->map, nintendo ? pad_hid_nin_map : def, sizeof def);
+// label (DM_PAD_FACE=label, pad_apple.h): the default map's face buttons name for name (usage 1 A, 2 B, 4 X, 5 Y) instead of by position; Nintendo's numbering is by label already
+static void pad_hid_init_face(pad_hid *h, const char *map, int nintendo, int label) {
+    static const uint8_t def[16] = {2, 1, 5, 4, 14, 15, 7, 8, 9, 10, 12, 11}, def_label[16] = {1, 2, 4, 5, 14, 15, 7, 8, 9, 10, 12, 11};
+    memset(h, 0, sizeof *h); h->hat = -1; h->raw = (uint8_t)!!nintendo; memcpy(h->map, nintendo ? pad_hid_nin_map : label ? def_label : def, sizeof def);
     for (int a = 0; a < PH_AXES; a++) h->axis[a] = a >= PH_BRAKE ? -1 : 0;
     for (const char *s = map; s && *s; s = strchr(s, ',') ? strchr(s, ',') + 1 : "") {
         const char *eq = strchr(s, '='), *end = strchr(s, ','); if (!eq || (end && eq > end)) continue;
@@ -60,6 +61,7 @@ static void pad_hid_init(pad_hid *h, const char *map, int nintendo) {
         for (int b = 0; b < 16; b++) if ((size_t)(eq - s) == strlen(pad_hid_names[b]) && !strncasecmp(s, pad_hid_names[b], eq - s) && u >= 0 && u <= 32) h->map[b] = (uint8_t)u;
     }
 }
+static void pad_hid_init(pad_hid *h, const char *map, int nintendo) { pad_hid_init_face(h, map, nintendo, 0); }
 static int pad_hid_axis_of(uint32_t page, uint32_t usage) {   // -1: not a gamepad axis
     if (page == 1 && usage >= 0x30 && usage <= 0x35) return PH_X + (int)(usage - 0x30);
     if (page == 2 && usage == 0xC5) return PH_BRAKE;

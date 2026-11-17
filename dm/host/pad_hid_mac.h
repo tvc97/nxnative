@@ -31,6 +31,7 @@
 #import <GameController/GCSyntheticDeviceKeys.h>
 #include <os/lock.h>
 #include "pad_hid.h"
+#include "pad_apple.h"   // dm_pad_face_by_label
 #include "pad_pro.h"
 #include "pad_jc1.h"
 #include "motion_pro.h"
@@ -324,7 +325,7 @@ static void hidpad_found(void *ctx, IOReturn result, void *sender, IOHIDDeviceRe
         int a = pad_hid_axis_of(page, IOHIDElementGetUsage(e)); if (a >= 0) has[a] = 1;
         d->nin |= pad_hid_nin_bit(IOHIDElementGetType(e) == kIOHIDElementTypeOutput, IOHIDElementGetReportID(e), page);
     }
-    pad_hid_init(&d->st, getenv("DM_HID_MAP"), d->nin & PAD_NIN_SIMPLE); memcpy(d->st.has, has, sizeof has);
+    pad_hid_init_face(&d->st, getenv("DM_HID_MAP"), d->nin & PAD_NIN_SIMPLE, dm_pad_face_by_label()); memcpy(d->st.has, has, sizeof has);
     d->hid = (IOHIDDeviceRef)CFRetain(hid);
     d->gc_hint = [GCController supportsHIDDevice:hid];   // once per device: the call is not cheap
     if (!d->gc_hint) { hidpad_use(d); return; }
@@ -454,7 +455,7 @@ static void hidpad_twins_take(GCController *gone) {
             IOHIDDeviceRegisterInputReportCallback(d->hid, d->report, sizeof d->report, hidpad_report, d);
         } else {
             uint8_t has[PH_AXES]; memcpy(has, d->st.has, sizeof has);   // the axes hidpad_found saw
-            pad_hid_init(&d->st, getenv("DM_HID_MAP"), d->nin & PAD_NIN_SIMPLE); memcpy(d->st.has, has, sizeof has);   // nothing held from an earlier turn
+            pad_hid_init_face(&d->st, getenv("DM_HID_MAP"), d->nin & PAD_NIN_SIMPLE, dm_pad_face_by_label()); memcpy(d->st.has, has, sizeof has);   // nothing held from an earlier turn
             IOHIDDeviceRegisterInputValueCallback(d->hid, hidpad_value, d);
         }
         hidpad_attach(d);

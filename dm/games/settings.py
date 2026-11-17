@@ -88,8 +88,9 @@ def build(gid, patched, control):
             if len(parts) != 2 or not all(parts): sys.exit(f'settings.tsv:{n}: platform default is <ios>|<mac>: {d}')
             d = parts[0] if platform == 'ios' else parts[1]
         if d.startswith('DM_GAME_'): return macro(d, n)
-        if d.startswith('build:'):
-            v = os.environ.get(d[6:], '')
+        if d.startswith('build:'):   # build:<VAR>, or build:<VAR>=<value> with the value when the build does not set it
+            var, _, dflt = d[6:].partition('=')
+            v = os.environ.get(var, '') or dflt
             return {'YES': '1', 'NO': '0', '': '0'}.get(v, v)   # build_ipa.sh's yes / no switches
         return d
 
